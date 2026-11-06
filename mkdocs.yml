@@ -193,6 +193,9 @@ nav:
       - Memory: user-guide/memory.md
       - External MCP Servers: user-guide/mcp-external-servers.md
       - Agents over MCP: user-guide/mcp-agents-endpoint.md
+      - Agent Teams: agent-teams.md
+      - Business Agent Teams Guide: user-guide/agent-teams-guide.md
+      - Soft Pack Media Team: soft-pack-marketing.md
       - Scheduler: user-guide/scheduler.md
       - Telemetry: user-guide/telemetry.md
       - Evaluations: user-guide/evaluations.md
