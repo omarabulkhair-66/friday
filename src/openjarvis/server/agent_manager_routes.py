@@ -94,9 +94,13 @@ class TeamPolicyRequest(BaseModel):
 class TeamConnectionRequest(BaseModel):
     name: str
     provider: str
+    transport: str = "http"
     url: str = ""
     auth_type: str = "bearer"
     token: SecretStr = SecretStr("")
+    # Local commands: secret environment values keyed by name.
+    env: Dict[str, SecretStr] = {}
+    oauth_client_secret: SecretStr = SecretStr("")
     settings: Dict[str, Any] = {}
 
 
@@ -1750,6 +1754,9 @@ def create_agent_manager_router(
                 auth_type=req.auth_type,
                 token=req.token.get_secret_value(),
                 settings=req.settings,
+                transport=req.transport,
+                env={k: v.get_secret_value() for k, v in req.env.items()},
+                oauth_client_secret=req.oauth_client_secret.get_secret_value(),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Team not found") from exc

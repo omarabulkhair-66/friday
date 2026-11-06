@@ -1270,15 +1270,50 @@ export async function deleteAgentTeam(id: string): Promise<void> {
   await agentTeamRequest(`/${encodeURIComponent(id)}`, 'DELETE');
 }
 
+export interface TeamConnectionSettings {
+  header_name?: string;
+  agent_ids?: string[];
+  verified_at?: number | null;
+  last_error?: string | null;
+  tools?: { name: string; description: string }[];
+  /** The library entry it was added from. */
+  catalog_id?: string;
+  transport?: 'http' | 'stdio';
+  command?: string;
+  args?: string[];
+  env_names?: string[];
+  oauth_client_id?: string;
+  oauth_scopes?: string[];
+  oauth_auth_params?: Record<string, string>;
+}
+
 export interface TeamConnection {
   id: string;
   team_id: string;
   name: string;
   provider: string;
+  transport: 'http' | 'stdio';
   url: string;
-  auth_type: 'bearer' | 'none' | 'header';
-  settings?: { header_name?: string; agent_ids?: string[]; verified_at?: number | null; last_error?: string | null; tools?: { name: string; description: string }[] };
+  auth_type: 'bearer' | 'none' | 'header' | 'oauth';
+  settings?: TeamConnectionSettings;
+  /** Names of environment variables with a saved value (never the values). */
+  env_set?: string[];
+  has_client_secret?: boolean;
+  oauth_status?: 'signed_out' | 'connected' | 'expired' | null;
   status: 'configured' | 'needs_authentication' | 'verified' | 'error';
+}
+
+/** Create payload. Secrets (token, env values, client secret) are write-only. */
+export interface TeamConnectionInput {
+  name: string;
+  provider: string;
+  transport?: 'http' | 'stdio';
+  url?: string;
+  auth_type: TeamConnection['auth_type'];
+  token?: string;
+  env?: Record<string, string>;
+  oauth_client_secret?: string;
+  settings?: Omit<TeamConnectionSettings, 'verified_at' | 'last_error' | 'tools' | 'transport'>;
 }
 
 export async function updateAgentTeamPolicy(id: string, communicateWith: string[]): Promise<AgentTeam> {
@@ -1296,10 +1331,7 @@ export async function fetchTeamConnections(teamId: string): Promise<TeamConnecti
   return (await res.json()).connections;
 }
 
-export async function createTeamConnection(teamId: string, connection: {
-  name: string; provider: string; url: string; auth_type: 'bearer' | 'none' | 'header'; token: string;
-  settings?: { header_name?: string; agent_ids?: string[] };
-}): Promise<TeamConnection> {
+export async function createTeamConnection(teamId: string, connection: TeamConnectionInput): Promise<TeamConnection> {
   const res = await apiFetch(`/v1/managed-agents/teams/${encodeURIComponent(teamId)}/connections`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(connection),
   });
@@ -1411,6 +1443,15 @@ export async function fetchCampaignFileBlob(campaignId: string, path: string): P
 
 export async function verifyTeamConnection(teamId: string, connectionId: string): Promise<TeamConnection> {
   return teamJson(`/teams/${encodeURIComponent(teamId)}/connections/${encodeURIComponent(connectionId)}/verify`, { method: 'POST' }, 'Verification failed.');
+}
+
+/** Returns the URL to open for signing this team's connection in. */
+export async function startTeamConnectionOAuth(teamId: string, connectionId: string): Promise<{ authorization_url: string; redirect_uri: string }> {
+  return teamJson(`/teams/${encodeURIComponent(teamId)}/connections/${encodeURIComponent(connectionId)}/oauth/start`, { method: 'POST' }, 'تعذّر بدء تسجيل الدخول.');
+}
+
+export async function signOutTeamConnectionOAuth(teamId: string, connectionId: string): Promise<TeamConnection> {
+  return teamJson(`/teams/${encodeURIComponent(teamId)}/connections/${encodeURIComponent(connectionId)}/oauth/sign-out`, { method: 'POST' }, 'تعذّر تسجيل الخروج.');
 }
 
 export async function setTeamConnectionAccess(teamId: string, connectionId: string, agentIds: string[]): Promise<TeamConnection> {

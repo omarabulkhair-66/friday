@@ -613,22 +613,10 @@ def create_mcp_router(
 
     from openjarvis.mcp import oauth as mcp_oauth
 
-    pending = mcp_oauth.PendingSignIns()
+    pending = mcp_oauth.shared_pending()
 
     def _redirect_uri(request: Request) -> str:
-        configured = getattr(_config().tools.mcp, "oauth_redirect_uri", "") or ""
-        if configured:
-            return configured
-        base = str(request.base_url).rstrip("/")
-        # Behind a local reverse proxy the forwarded scheme can be https
-        # while this server only speaks http on loopback; the browser
-        # reaches the callback directly, so use the socket address.
-        server = request.scope.get("server")
-        if urlparse(base).hostname in ("127.0.0.1", "localhost", "::1") and server:
-            host, port = server[0], server[1]
-            host = f"[{host}]" if ":" in str(host) else host
-            base = f"http://{host}:{port}"
-        return f"{base}/v1/mcp/oauth/callback"
+        return oauth_redirect_uri_for(request, _config())
 
     @router.get("/oauth/redirect-uri")
     def oauth_redirect_uri(request: Request) -> dict[str, Any]:
@@ -697,6 +685,16 @@ def create_mcp_router(
             tokens = await run_in_threadpool(mcp_oauth.exchange_code, sign_in, code)
         except mcp_oauth.OAuthError as exc:
             return _callback_page(False, str(exc))
+        if sign_in.save is not None:
+            # A team connection: its own store, never the global one.
+            try:
+                error = await run_in_threadpool(sign_in.save, tokens)
+            except Exception:
+                logger.warning("Could not store MCP sign-in tokens")
+                error = "Could not save the sign-in. Try again."
+            if error:
+                return _callback_page(False, error)
+            return _callback_page(True, "Signed in. You can close this window.")
         if _store_call(lambda: mcp_store.get(sign_in.server_id)) is None:
             return _callback_page(False, "The MCP server was deleted.")
         _store_call(lambda: mcp_store.set_oauth_tokens(sign_in.server_id, tokens))
@@ -710,6 +708,24 @@ def create_mcp_router(
         return {"signed_out": True, "restart_required": _restart_required()}
 
     return router
+
+
+def oauth_redirect_uri_for(request: Request, config: Any) -> str:
+    """The OAuth redirect URI for sign-ins started from ``request``."""
+    mcp_config = getattr(getattr(config, "tools", None), "mcp", None)
+    configured = getattr(mcp_config, "oauth_redirect_uri", "") or ""
+    if configured:
+        return configured
+    base = str(request.base_url).rstrip("/")
+    # Behind a local reverse proxy the forwarded scheme can be https
+    # while this server only speaks http on loopback; the browser
+    # reaches the callback directly, so use the socket address.
+    server = request.scope.get("server")
+    if urlparse(base).hostname in ("127.0.0.1", "localhost", "::1") and server:
+        host, port = server[0], server[1]
+        host = f"[{host}]" if ":" in str(host) else host
+        base = f"http://{host}:{port}"
+    return f"{base}/v1/mcp/oauth/callback"
 
 
 def _callback_page(ok: bool, message: str) -> HTMLResponse:
@@ -733,4 +749,9 @@ try {{ window.opener && window.opener.postMessage(
     )
 
 
-__all__ = ["MCPServerIn", "create_mcp_router", "run_server_test"]
+__all__ = [
+    "MCPServerIn",
+    "create_mcp_router",
+    "oauth_redirect_uri_for",
+    "run_server_test",
+]

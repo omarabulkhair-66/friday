@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import File, Form, HTTPException, UploadFile
+from fastapi import File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -278,6 +278,42 @@ def register_campaign_routes(router: Any, manager: Any) -> None:
         result["tools"] = tools
         return result
 
+    @router.post("/teams/{team_id}/connections/{connection_id}/oauth/start")
+    async def connection_oauth_start(
+        team_id: str, connection_id: str, request: Request
+    ):
+        """Begin OAuth sign-in for this team's connection only.
+
+        Completes at the shared ``/v1/mcp/oauth/callback``; the tokens are
+        saved to this connection, never to the global MCP store.
+        """
+        from starlette.concurrency import run_in_threadpool
+
+        connection = manager.get_team_connection(team_id, connection_id)
+        if connection is None:
+            raise HTTPException(404, "الاتصال غير موجود.")
+        if connection["auth_type"] != "oauth":
+            raise HTTPException(400, "هذا الاتصال لا يستخدم تسجيل الدخول OAuth.")
+        redirect_uri = _team_redirect_uri(request)
+        try:
+            url = await run_in_threadpool(
+                _start_team_sign_in, manager, connection, redirect_uri
+            )
+        except _McpVerifyError as exc:
+            raise _http(exc) from exc
+        return {"authorization_url": url, "redirect_uri": redirect_uri}
+
+    @router.post("/teams/{team_id}/connections/{connection_id}/oauth/sign-out")
+    async def connection_oauth_sign_out(team_id: str, connection_id: str):
+        try:
+            manager.set_team_connection_oauth_tokens(team_id, connection_id, None)
+        except KeyError as exc:
+            raise HTTPException(404, "الاتصال غير موجود.") from exc
+        manager.update_team_connection_settings(
+            team_id, connection_id, verified_at=None, last_error=None
+        )
+        return manager.get_team_connection(team_id, connection_id)
+
     @router.put("/teams/{team_id}/connections/{connection_id}/access")
     async def connection_access(team_id: str, connection_id: str, req: AccessRequest):
         try:
@@ -294,6 +330,67 @@ class _McpVerifyError(RuntimeError):
     pass
 
 
+def _team_redirect_uri(request: Any) -> str:
+    """The same redirect URI as global sign-ins (one to register)."""
+    from openjarvis.server.mcp_routes import oauth_redirect_uri_for
+
+    return oauth_redirect_uri_for(request, getattr(request.app.state, "config", None))
+
+
+def _start_team_sign_in(
+    manager: Any, connection: Dict[str, Any], redirect_uri: str
+) -> str:
+    """Discover, register a client if needed, and return the sign-in URL."""
+    from openjarvis.mcp import oauth as mcp_oauth
+
+    team_id, connection_id = connection["team_id"], connection["id"]
+    settings = connection.get("settings") or {}
+    client_id = settings.get("oauth_client_id")
+    client_secret = manager._team_connection_client_secret(connection_id)
+    try:
+        discovery = mcp_oauth.discover(connection["url"])
+        if not client_id:
+            if not discovery.registration_endpoint:
+                raise mcp_oauth.OAuthError(
+                    "This server needs an OAuth client you create yourself. "
+                    "Add the connection again with its client ID and secret."
+                )
+            registered = mcp_oauth.register_client(
+                discovery.registration_endpoint, redirect_uri
+            )
+            client_id = registered["client_id"]
+            client_secret = registered.get("client_secret")
+    except mcp_oauth.OAuthError as exc:
+        raise _McpVerifyError(str(exc)) from None
+
+    def save(tokens: Dict[str, Any]) -> Optional[str]:
+        try:
+            manager.set_team_connection_oauth_tokens(team_id, connection_id, tokens)
+        except KeyError:
+            return "The team connection was deleted."
+        manager.update_team_connection_settings(
+            team_id, connection_id, verified_at=None, last_error=None
+        )
+        return None
+
+    sign_in = mcp_oauth.PendingSignIn(
+        server_id=connection_id,
+        verifier="",
+        redirect_uri=redirect_uri,
+        discovery=discovery,
+        client_id=client_id,
+        client_secret=client_secret,
+        save=save,
+    )
+    scopes = list(settings.get("oauth_scopes") or []) or discovery.scopes
+    return mcp_oauth.start_sign_in(
+        sign_in,
+        mcp_oauth.shared_pending(),
+        scopes,
+        settings.get("oauth_auth_params") or {},
+    )
+
+
 def _verify_mcp(manager: Any, connection: Dict[str, Any]) -> List[Dict[str, str]]:
     """Connect with the team's credential and list the server's tools."""
     import httpx
@@ -301,21 +398,35 @@ def _verify_mcp(manager: Any, connection: Dict[str, Any]) -> List[Dict[str, str]
     from openjarvis.agents.team_tools import open_team_mcp_client
     from openjarvis.tools.mcp_adapter import MCPToolProvider
 
+    if connection.get("oauth_status") == "signed_out":
+        raise _McpVerifyError("سجّل الدخول إلى هذا الاتصال أولًا.")
+    if connection.get("transport") == "stdio" and connection["status"] == (
+        "needs_authentication"
+    ):
+        raise _McpVerifyError("أدخل قيم متغيرات البيئة المطلوبة لهذا الأمر.")
     client = None
     try:
         client = open_team_mcp_client(manager, connection)
         tools = MCPToolProvider(client).discover()
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        if code in {401, 403} and connection["auth_type"] == "oauth":
+            message = "رفض الخادم تسجيل الدخول؛ سجّل الدخول من جديد."
+        elif code in {401, 403}:
+            message = "رفض خادم MCP المصادقة؛ راجع المفتاح."
+        else:
+            message = f"ردّ خادم MCP بخطأ (HTTP {code})."
+        raise _McpVerifyError(message) from None
+    except FileNotFoundError:
         raise _McpVerifyError(
-            "رفض خادم MCP المصادقة؛ راجع المفتاح."
-            if code in {401, 403}
-            else f"ردّ خادم MCP بخطأ (HTTP {code})."
+            "تعذّر تشغيل الأمر؛ تأكد أنه مثبت على هذا الجهاز."
         ) from None
     except Exception:
         # Never echo upstream text: it may contain the credential.
         raise _McpVerifyError(
             "تعذّر الاتصال بخادم MCP؛ راجع العنوان والمصادقة."
+            if connection.get("transport") != "stdio"
+            else "بدأ الأمر لكنه لم يستجب كخادم MCP؛ راجع الأمر ووسائطه."
         ) from None
     finally:
         if client is not None:

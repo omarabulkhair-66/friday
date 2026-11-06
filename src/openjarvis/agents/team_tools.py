@@ -424,26 +424,92 @@ class CampaignFilesTool(ManagedPeersTool):
         )
 
 
-def open_team_mcp_client(manager: Any, connection: Dict[str, Any]) -> Any:
-    """Initialize a private client with this connection's own credential."""
-    from openjarvis.mcp.client import MCPClient
-    from openjarvis.mcp.transport import StreamableHTTPTransport
+class TeamOAuthStore:
+    """OAuth token storage bound to one team.
 
-    token, headers = None, {}
+    Gives :class:`openjarvis.mcp.oauth.OAuthTokenProvider` the store shape it
+    expects, reading and writing only this team's connection secrets — never
+    the global MCP store or another team's.
+    """
+
+    def __init__(self, manager: Any, team_id: str):
+        self._manager, self._team_id = manager, team_id
+
+    def oauth_tokens(self, connection_id: str) -> Any:
+        return self._manager.team_connection_oauth_tokens(self._team_id, connection_id)
+
+    def set_oauth_tokens(self, connection_id: str, tokens: Any) -> None:
+        self._manager.set_team_connection_oauth_tokens(
+            self._team_id, connection_id, tokens
+        )
+
+
+def team_connection_secret_values(
+    manager: Any, connection: Dict[str, Any]
+) -> List[str]:
+    """Every stored secret of a connection, so error text can be redacted."""
+    values: List[str] = []
+    cid = connection["id"]
+    if connection["auth_type"] in {"bearer", "header"}:
+        try:
+            values.append(manager._team_connection_token(cid))
+        except OSError:
+            pass
+    values += list(manager._team_connection_env(cid).values())
+    secret = manager._team_connection_client_secret(cid)
+    if secret:
+        values.append(secret)
+    tokens = manager.team_connection_oauth_tokens(connection["team_id"], cid) or {}
+    values += [tokens.get(k) for k in ("access_token", "refresh_token")]
+    return [v for v in values if v]
+
+
+def build_team_transport(
+    manager: Any, connection: Dict[str, Any], *, request_timeout: float = 120
+) -> Any:
+    """Transport that carries only this connection's own credential."""
+    from openjarvis.mcp.transport import StdioTransport, StreamableHTTPTransport
+
+    settings = connection.get("settings") or {}
+    if (connection.get("transport") or settings.get("transport")) == "stdio":
+        return StdioTransport(
+            [settings["command"], *settings.get("args", [])],
+            env=manager._team_connection_env(connection["id"]),
+            # No credentials inherited from this process's environment.
+            inherit_env=False,
+            response_timeout=request_timeout,
+        )
+    token, headers, provider = None, {}, None
     if connection["auth_type"] == "bearer":
         token = manager._team_connection_token(connection["id"])
     elif connection["auth_type"] == "header":
-        header = (connection.get("settings") or {}).get("header_name")
-        headers = {header: manager._team_connection_token(connection["id"])}
-    client = MCPClient(
-        StreamableHTTPTransport(
-            connection["url"],
-            token=token,
-            headers=headers,
-            connect_timeout=10,
-            request_timeout=120,
+        headers = {
+            settings.get("header_name"): manager._team_connection_token(
+                connection["id"]
+            )
+        }
+    elif connection["auth_type"] == "oauth":
+        from openjarvis.mcp.oauth import OAuthTokenProvider
+
+        provider = OAuthTokenProvider(
+            TeamOAuthStore(manager, connection["team_id"]), connection["id"]
         )
+    return StreamableHTTPTransport(
+        connection["url"],
+        token=token,
+        headers=headers,
+        token_provider=provider,
+        connect_timeout=10,
+        request_timeout=request_timeout,
     )
+
+
+def open_team_mcp_client(manager: Any, connection: Dict[str, Any]) -> Any:
+    """Initialize a private client with this connection's own credential."""
+    from openjarvis.mcp.client import MCPClient
+
+    transport = build_team_transport(manager, connection)
+    client = MCPClient(transport)
     try:
         client.initialize()
     except Exception:

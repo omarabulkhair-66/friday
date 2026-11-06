@@ -75,12 +75,17 @@ class StdioTransport(MCPTransport):
         *,
         response_timeout: float = 600.0,
         env: Optional[Dict[str, str]] = None,
+        inherit_env: bool = True,
     ) -> None:
         if response_timeout <= 0:
             raise ValueError("response_timeout must be positive")
         self._command = command
         # Extra variables layered on top of the parent environment.
         self._env = dict(env) if env else None
+        # ``False`` starts the command with only basic system variables
+        # (PATH, HOME, locale...) plus ``env``, so it cannot pick up
+        # credentials from this process's environment.
+        self._inherit_env = inherit_env
         self._response_timeout = response_timeout
         self._process: Optional[subprocess.Popen[str]] = None
         self._stdout_queue: queue.Queue[Any] = queue.Queue(
@@ -96,6 +101,31 @@ class StdioTransport(MCPTransport):
         self._request_lock = threading.Lock()
         self._start()
 
+    _BASE_ENV_NAMES = (
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "TERM",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+    )
+
+    def _child_env(self) -> Optional[Dict[str, str]]:
+        if not self._inherit_env:
+            base = {k: os.environ[k] for k in self._BASE_ENV_NAMES if k in os.environ}
+            return {**base, **(self._env or {})}
+        return {**os.environ, **self._env} if self._env else None
+
     def _start(self) -> None:
         """Start the subprocess."""
         self._process = subprocess.Popen(
@@ -104,7 +134,7 @@ class StdioTransport(MCPTransport):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env={**os.environ, **self._env} if self._env else None,
+            env=self._child_env(),
         )
         self._reader_thread = threading.Thread(
             target=self._read_stdout,

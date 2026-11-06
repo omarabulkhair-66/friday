@@ -50,3 +50,16 @@ it('sends a company credential only when saving its own connection', async () =>
   expect(fetchMock.mock.calls[2][0]).toBe('/v1/managed-agents/teams/team-a/policy');
   expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string)).toEqual({ communicate_with: ['team-b'] });
 });
+
+it('signs a team connection in and out through its own team routes', async () => {
+  const { startTeamConnectionOAuth, signOutTeamConnectionOAuth } = await import('./api');
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ authorization_url: 'https://auth.example.test/a', redirect_uri: 'r' })));
+  await expect(startTeamConnectionOAuth('team-a', 'c1')).resolves.toMatchObject({ authorization_url: 'https://auth.example.test/a' });
+  expect(fetchMock.mock.calls[0][0]).toBe('/v1/managed-agents/teams/team-a/connections/c1/oauth/start');
+  expect(fetchMock.mock.calls[0][1]?.method).toBe('POST');
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ id: 'c1', oauth_status: 'signed_out' })));
+  await signOutTeamConnectionOAuth('team-a', 'c1');
+  expect(fetchMock.mock.calls[1][0]).toBe('/v1/managed-agents/teams/team-a/connections/c1/oauth/sign-out');
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'الاتصال غير موجود.' }), { status: 404 }));
+  await expect(startTeamConnectionOAuth('team-a', 'other')).rejects.toThrow('الاتصال غير موجود.');
+});

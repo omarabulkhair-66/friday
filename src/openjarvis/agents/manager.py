@@ -808,7 +808,7 @@ class AgentManager:
             if not cursor.rowcount:
                 raise KeyError("Team not found")
         for connection in connections:
-            self._connection_secret_path(connection["id"]).unlink(missing_ok=True)
+            self._remove_connection_secrets(connection["id"])
 
     @staticmethod
     def _row_to_team(row: sqlite3.Row) -> Dict[str, Any]:
@@ -922,6 +922,34 @@ class AgentManager:
             raise ValueError("Invalid connection ID")
         return Path(self._db_path).parent / "team-connection-secrets" / connection_id
 
+    def _connection_secrets_path(self, connection_id: str):
+        """Structured secrets of one connection: env values and OAuth state."""
+        path = self._connection_secret_path(connection_id)
+        return path.with_name(f"{path.name}.json")
+
+    def _connection_secrets(self, connection_id: str) -> Dict[str, Any]:
+        path = self._connection_secrets_path(connection_id)
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def _write_connection_secrets(
+        self, connection_id: str, secrets: Dict[str, Any]
+    ) -> None:
+        from openjarvis.security.file_utils import secure_write_json
+
+        path = self._connection_secrets_path(connection_id)
+        if not secrets:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        secure_write_json(path, secrets)
+
+    def _remove_connection_secrets(self, connection_id: str) -> None:
+        self._connection_secret_path(connection_id).unlink(missing_ok=True)
+        self._connection_secrets_path(connection_id).unlink(missing_ok=True)
+
     @_db_locked
     def list_team_connections(self, team_id: str) -> List[Dict[str, Any]]:
         """List this team's independent connections, never credential values."""
@@ -936,10 +964,31 @@ class AgentManager:
             if connection.pop("kind", "mcp") != "mcp":
                 continue
             connection["settings"] = json.loads(connection.pop("settings_json") or "{}")
-            configured = (
-                row["auth_type"] == "none"
-                or self._connection_secret_path(row["id"]).is_file()
-            )
+            settings = connection["settings"]
+            connection["transport"] = settings.get("transport") or "http"
+            secrets = self._connection_secrets(row["id"])
+            env_set = sorted(k for k, v in (secrets.get("env") or {}).items() if v)
+            connection["env_set"] = env_set
+            connection["has_client_secret"] = bool(secrets.get("oauth_client_secret"))
+            connection["oauth_status"] = None
+            if connection["transport"] == "stdio":
+                configured = set(settings.get("env_names") or []) <= set(env_set)
+            elif row["auth_type"] == "oauth":
+                from openjarvis.mcp.oauth import is_expired
+
+                tokens = secrets.get("oauth")
+                if not tokens:
+                    connection["oauth_status"] = "signed_out"
+                elif is_expired(tokens) and not tokens.get("refresh_token"):
+                    connection["oauth_status"] = "expired"
+                else:
+                    connection["oauth_status"] = "connected"
+                configured = connection["oauth_status"] == "connected"
+            else:
+                configured = (
+                    row["auth_type"] == "none"
+                    or self._connection_secret_path(row["id"]).is_file()
+                )
             # Saved settings are "configured"; only a successful live check by
             # the provider client (verify) records "verified".
             if not configured:
@@ -996,15 +1045,22 @@ class AgentManager:
         *,
         name: str,
         provider: str,
-        url: str,
+        url: str = "",
         auth_type: str = "bearer",
         token: str = "",
         settings: Optional[Dict[str, Any]] = None,
+        transport: str = "http",
+        env: Optional[Dict[str, str]] = None,
+        oauth_client_secret: str = "",
     ) -> Dict[str, Any]:
-        """Save a team-owned HTTP connection and private per-connection credential.
+        """Save a team-owned MCP connection and its private credentials.
 
-        The token is stored in a mode-0600 file, never in process environment,
-        returned metadata, agent configuration or the global MCP credential.
+        ``transport`` is ``http`` (Streamable HTTP with bearer, custom header,
+        OAuth or no auth) or ``stdio`` (a local command, settings ``command``,
+        ``args`` and ``env_names``; values in ``env``). Credentials are stored
+        in mode-0600 files for this connection only, never in the process
+        environment, returned metadata, agent configuration or the global MCP
+        store.
         """
         from urllib.parse import urlsplit
 
@@ -1013,27 +1069,62 @@ class AgentManager:
         if not self.get_team(team_id):
             raise KeyError("Team not found")
         name, provider = self._team_name(name), self._team_name(provider)
-        settings = self._mcp_settings(team_id, settings or {}, auth_type)
-        parsed = urlsplit(url)
-        if not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Use an MCP endpoint without credentials in its URL")
-        if parsed.query or parsed.fragment:
-            raise ValueError("Put authentication in the credential field, not the URL")
-        if parsed.scheme != "https" and not (
-            parsed.scheme == "http"
-            and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        ):
-            raise ValueError("Use HTTPS, or HTTP for an explicitly local MCP server")
-        if auth_type not in {"bearer", "none", "header"}:
-            raise ValueError("Choose bearer, header or none authentication")
-        if auth_type == "none" and token:
-            raise ValueError("Choose bearer authentication when supplying a credential")
+        if transport not in {"http", "stdio"}:
+            raise ValueError("Choose the http or stdio transport")
+        secrets: Dict[str, Any] = {}
+        if transport == "stdio":
+            if token or oauth_client_secret:
+                raise ValueError("A local command takes environment variables only")
+            auth_type, url = "none", ""
+            settings = self._stdio_settings(team_id, settings or {})
+            names = settings["env_names"]
+            values = {k: str(v) for k, v in (env or {}).items() if v}
+            if any(k not in names for k in values):
+                raise ValueError("Environment values must be listed in env_names")
+            if any(len(v) > 8192 for v in values.values()):
+                raise ValueError("Environment values must be at most 8192 characters")
+            if values:
+                secrets["env"] = values
+        else:
+            if env:
+                raise ValueError("Environment variables are for local commands only")
+            if auth_type not in {"bearer", "none", "header", "oauth"}:
+                raise ValueError("Choose bearer, header, OAuth or no authentication")
+            if auth_type in {"none", "oauth"} and token:
+                raise ValueError(
+                    "Choose bearer authentication when supplying a credential"
+                )
+            if auth_type != "oauth" and oauth_client_secret:
+                raise ValueError("A client secret is only used for OAuth sign-in")
+            settings = self._mcp_settings(team_id, settings or {}, auth_type)
+            parsed = urlsplit(url)
+            if not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("Use an MCP endpoint without credentials in its URL")
+            if parsed.query or parsed.fragment:
+                raise ValueError(
+                    "Put authentication in the credential field, not the URL"
+                )
+            if parsed.scheme != "https" and not (
+                parsed.scheme == "http"
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError(
+                    "Use HTTPS, or HTTP for an explicitly local MCP server"
+                )
+            if oauth_client_secret.strip():
+                secrets["oauth_client_secret"] = oauth_client_secret.strip()
+        settings["transport"] = transport
+        # Which library entry it was added from; display only.
+        catalog_id = str(settings.get("catalog_id") or "")
+        if catalog_id and not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", catalog_id):
+            raise ValueError("Invalid catalog entry")
         connection_id = uuid.uuid4().hex
         secret_path = self._connection_secret_path(connection_id)
         try:
             if token.strip():
                 secret_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 secure_write_text(secret_path, token.strip(), mode=0o600)
+            self._write_connection_secrets(connection_id, secrets)
             with self._conn:
                 self._conn.execute(
                     "INSERT INTO team_mcp_connections "
@@ -1051,7 +1142,7 @@ class AgentManager:
                     ),
                 )
         except Exception:
-            secret_path.unlink(missing_ok=True)
+            self._remove_connection_secrets(connection_id)
             raise
         return next(
             c for c in self.list_team_connections(team_id) if c["id"] == connection_id
@@ -1079,6 +1170,63 @@ class AgentManager:
             ):
                 raise ValueError("Choose a valid authentication header name")
             clean["header_name"] = header
+        if auth_type == "oauth":
+            client_id = str(settings.get("oauth_client_id") or "").strip()
+            if len(client_id) > 512:
+                raise ValueError("The OAuth client ID is too long")
+            if client_id:
+                clean["oauth_client_id"] = client_id
+            scopes = settings.get("oauth_scopes") or []
+            if not isinstance(scopes, list) or len(scopes) > 50:
+                raise ValueError("oauth_scopes must be a list")
+            clean["oauth_scopes"] = [
+                str(x).strip()[:512] for x in scopes if str(x).strip()
+            ]
+            params = settings.get("oauth_auth_params") or {}
+            if not isinstance(params, dict) or len(params) > 10:
+                raise ValueError("oauth_auth_params must be an object")
+            if any(k in self._OAUTH_RESERVED_PARAMS for k in params):
+                raise ValueError("oauth_auth_params cannot override core parameters")
+            clean["oauth_auth_params"] = {
+                str(k)[:64]: str(v)[:512] for k, v in params.items()
+            }
+        if settings.get("catalog_id"):
+            clean["catalog_id"] = settings["catalog_id"]
+        clean["agent_ids"] = self._member_ids(team_id, settings.get("agent_ids") or [])
+        return clean
+
+    _OAUTH_RESERVED_PARAMS = {
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "resource",
+        "scope",
+    }
+
+    def _stdio_settings(self, team_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a local command: command, args, env var names, agents."""
+        command = str(settings.get("command") or "").strip()
+        if not command or len(command) > 1024:
+            raise ValueError("Enter the command that starts the MCP server")
+        args = settings.get("args") or []
+        if not isinstance(args, list) or len(args) > 100:
+            raise ValueError("args must be a list")
+        names = settings.get("env_names") or []
+        if not isinstance(names, list) or len(names) > 50:
+            raise ValueError("env_names must be a list")
+        names = list(dict.fromkeys(str(n).strip() for n in names if str(n).strip()))
+        if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n) for n in names):
+            raise ValueError("env_names must be valid environment variable names")
+        clean: Dict[str, Any] = {
+            "command": command,
+            "args": [str(a)[:4096] for a in args],
+            "env_names": names,
+        }
+        if settings.get("catalog_id"):
+            clean["catalog_id"] = settings["catalog_id"]
         clean["agent_ids"] = self._member_ids(team_id, settings.get("agent_ids") or [])
         return clean
 
@@ -1124,7 +1272,7 @@ class AgentManager:
         self._conn.commit()
         if not cursor.rowcount:
             raise KeyError("Connection not found")
-        self._connection_secret_path(connection_id).unlink(missing_ok=True)
+        self._remove_connection_secrets(connection_id)
 
     @_db_locked
     def team_connection_allowed(self, agent_id: str, connection_id: str) -> bool:
@@ -1141,6 +1289,45 @@ class AgentManager:
     def _team_connection_token(self, connection_id: str) -> str:
         """Read only the selected connection's credential for transport construction."""
         return self._connection_secret_path(connection_id).read_text().strip()
+
+    @_db_locked
+    def _team_connection_env(self, connection_id: str) -> Dict[str, str]:
+        """Secret environment values of one local-command connection."""
+        env = self._connection_secrets(connection_id).get("env") or {}
+        return {str(k): str(v) for k, v in env.items()}
+
+    @_db_locked
+    def _team_connection_client_secret(self, connection_id: str) -> Optional[str]:
+        return self._connection_secrets(connection_id).get("oauth_client_secret")
+
+    @_db_locked
+    def team_connection_oauth_tokens(
+        self, team_id: str, connection_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """OAuth tokens of one team's connection (``None`` if not signed in)."""
+        if self.get_team_connection(team_id, connection_id) is None:
+            return None
+        tokens = self._connection_secrets(connection_id).get("oauth")
+        return dict(tokens) if isinstance(tokens, dict) else None
+
+    @_db_locked
+    def set_team_connection_oauth_tokens(
+        self, team_id: str, connection_id: str, tokens: Optional[Dict[str, Any]]
+    ) -> None:
+        """Store (or with ``None`` remove) the tokens of this team's connection.
+
+        Refuses a connection that is not this team's OAuth connection, so a
+        sign-in can never land in another team's or the global store.
+        """
+        connection = self.get_team_connection(team_id, connection_id)
+        if connection is None or connection["auth_type"] != "oauth":
+            raise KeyError("Connection not found")
+        secrets = self._connection_secrets(connection_id)
+        if tokens:
+            secrets["oauth"] = dict(tokens)
+        else:
+            secrets.pop("oauth", None)
+        self._write_connection_secrets(connection_id, secrets)
 
     # ── Message queue ─────────────────────────────────────────────
 
