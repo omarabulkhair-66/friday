@@ -278,6 +278,7 @@ class StreamableHTTPTransport(MCPTransport):
         connect_timeout: float = 10.0,
         request_timeout: float = 60.0,
         token_provider: Optional[Callable[[bool], Optional[str]]] = None,
+        headers: Optional[dict] = None,
     ) -> None:
         import httpx
 
@@ -289,6 +290,8 @@ class StreamableHTTPTransport(MCPTransport):
         # Custom header name for the token (e.g. ``X-API-Key``). ``None``
         # keeps the default ``Authorization: Bearer <token>`` form.
         self._auth_header = auth_header or None
+        # Extra static headers (e.g. a team connection's custom auth header).
+        self._extra_headers = dict(headers or {})
         self._session_id: Optional[str] = None
         self._client = httpx.Client(
             timeout=httpx.Timeout(
@@ -329,6 +332,7 @@ class StreamableHTTPTransport(MCPTransport):
                 headers[self._auth_header] = token
             else:
                 headers["Authorization"] = f"Bearer {token}"
+        headers.update(self._extra_headers)
         if self._session_id is not None:
             headers["Mcp-Session-Id"] = self._session_id
         return headers
