@@ -65,6 +65,8 @@ Safety limits:
 - A run that returns nothing is retried once after a minute, then marked failed.
 - Content written by agents is fenced in the recipient's prompt as untrusted data with no authority to change permissions, budgets or connections. Files cannot be shared with another team.
 
+Outside MCP clients such as Claude Code can send teams requests and read their results through the [`/mcp` endpoint](user-guide/mcp-agents-endpoint.md).
+
 ## Final images
 
 A request ends with the exported PNG in the request's `final/` folder. The request page shows every final image at full width, newest first, with a **Download PNG** link; you review and use it yourself. To ask for changes, send the team a follow-up message on the same page.

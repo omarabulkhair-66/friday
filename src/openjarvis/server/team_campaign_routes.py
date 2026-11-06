@@ -63,6 +63,52 @@ async def _save_image(upload: UploadFile, folder: Path, stem: str) -> str:
     return f"originals/{path.name}"
 
 
+def campaign_view(
+    manager: Any, campaign: Dict[str, Any], *, detail: bool = False
+) -> Dict[str, Any]:
+    """A request with its display status and, with *detail*, handoffs and files."""
+    store = manager.campaigns
+    handoffs = store.list_handoffs(campaign["id"])
+    open_count = sum(
+        h["status"] in {"pending", "running", "waiting_paused"} for h in handoffs
+    )
+    attention = [h for h in handoffs if h["status"] in {"blocked", "failed"}]
+    value = dict(campaign)
+    if campaign["status"] == "active" and attention and not open_count:
+        value["display_status"] = "needs_attention"
+    elif campaign["status"] == "active" and not open_count:
+        value["display_status"] = "waiting_for_you"
+    else:
+        value["display_status"] = campaign["status"]
+    value["open_handoffs"] = open_count
+    value["attention_count"] = len(attention)
+    if detail:
+        names = {a["id"]: a["name"] for a in manager.list_agents(include_archived=True)}
+        for handoff in handoffs:
+            handoff["source_name"] = (
+                names.get(handoff["source_agent_id"], "")
+                if handoff["source_agent_id"]
+                else "أنت"
+            )
+            handoff["target_name"] = names.get(handoff["target_agent_id"], "")
+            handoff["result"] = None
+            if handoff["result_message_id"]:
+                message = next(
+                    (
+                        m
+                        for m in manager.list_messages(
+                            handoff["target_agent_id"], limit=200
+                        )
+                        if m["id"] == handoff["result_message_id"]
+                    ),
+                    None,
+                )
+                handoff["result"] = (message or {}).get("content")
+        value["handoffs"] = handoffs
+        value["files"] = store.list_files(campaign)
+    return value
+
+
 def register_campaign_routes(router: Any, manager: Any) -> None:
     from openjarvis.agents.campaigns import HandoffRejected
 
@@ -75,47 +121,7 @@ def register_campaign_routes(router: Any, manager: Any) -> None:
         return campaign
 
     def view(campaign: Dict[str, Any], *, detail: bool = False) -> Dict[str, Any]:
-        handoffs = store.list_handoffs(campaign["id"])
-        open_count = sum(
-            h["status"] in {"pending", "running", "waiting_paused"} for h in handoffs
-        )
-        attention = [h for h in handoffs if h["status"] in {"blocked", "failed"}]
-        value = dict(campaign)
-        if campaign["status"] == "active" and attention and not open_count:
-            value["display_status"] = "needs_attention"
-        elif campaign["status"] == "active" and not open_count:
-            value["display_status"] = "waiting_for_you"
-        else:
-            value["display_status"] = campaign["status"]
-        value["open_handoffs"] = open_count
-        value["attention_count"] = len(attention)
-        if detail:
-            names = {
-                a["id"]: a["name"] for a in manager.list_agents(include_archived=True)
-            }
-            for handoff in handoffs:
-                handoff["source_name"] = (
-                    names.get(handoff["source_agent_id"], "")
-                    if handoff["source_agent_id"]
-                    else "أنت"
-                )
-                handoff["target_name"] = names.get(handoff["target_agent_id"], "")
-                handoff["result"] = None
-                if handoff["result_message_id"]:
-                    message = next(
-                        (
-                            m
-                            for m in manager.list_messages(
-                                handoff["target_agent_id"], limit=200
-                            )
-                            if m["id"] == handoff["result_message_id"]
-                        ),
-                        None,
-                    )
-                    handoff["result"] = (message or {}).get("content")
-            value["handoffs"] = handoffs
-            value["files"] = store.list_files(campaign)
-        return value
+        return campaign_view(manager, campaign, detail=detail)
 
     # ── Orchestrator ─────────────────────────────────────────────
 
@@ -445,4 +451,4 @@ def _verify_mcp(manager: Any, connection: Dict[str, Any]) -> List[Dict[str, str]
     ]
 
 
-__all__ = ["register_campaign_routes"]
+__all__ = ["campaign_view", "register_campaign_routes"]

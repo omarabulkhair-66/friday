@@ -53,6 +53,8 @@ class MCPServer:
     SERVER_NAME = "openjarvis"
     SERVER_VERSION = "0.1.0"
     PROTOCOL_VERSION = "2025-11-25"
+    # Older revisions a client may ask for; tools work the same in each.
+    SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
 
     def __init__(
         self,
@@ -63,6 +65,8 @@ class MCPServer:
         rate_limiter: Optional[Any] = None,
         agent_id: str = _MCP_AGENT_ID,
         allowed_dirs: Optional[List[str]] = None,
+        title: str = "OpenJarvis Tool Server",
+        instructions: str = "",
     ) -> None:
         """Create an MCP server with the same dispatch gates as other agents.
 
@@ -76,7 +80,11 @@ class MCPServer:
         ``allowed_dirs`` supplies the active configuration's filesystem policy
         to auto-discovered file tools; explicitly supplied tools keep their own
         constructor policy.
+
+        ``title`` and ``instructions`` are returned from ``initialize``.
         """
+        self._title = title
+        self._instructions = instructions
         if tools is None:
             tools = self._auto_discover_tools(allowed_dirs=allowed_dirs)
         self._tools: Dict[str, BaseTool] = {t.spec.name: t for t in tools}
@@ -236,6 +244,8 @@ class MCPServer:
             return self._handle_tools_list(request)
         elif request.method == "tools/call":
             return self._handle_tools_call(request)
+        elif request.method == "ping":
+            return MCPResponse(result={}, id=request.id)
         else:
             return MCPResponse.error_response(
                 request.id,
@@ -245,20 +255,25 @@ class MCPServer:
 
     def _handle_initialize(self, req: MCPRequest) -> MCPResponse:
         """Handle the initialize handshake."""
-        return MCPResponse(
-            result={
-                "protocolVersion": self.PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {"listChanged": True},
-                },
-                "serverInfo": {
-                    "name": self.SERVER_NAME,
-                    "version": self.SERVER_VERSION,
-                    "title": "OpenJarvis Tool Server",
-                },
+        requested = req.params.get("protocolVersion")
+        result: Dict[str, Any] = {
+            "protocolVersion": (
+                requested
+                if requested in self.SUPPORTED_PROTOCOL_VERSIONS
+                else self.PROTOCOL_VERSION
+            ),
+            "capabilities": {
+                "tools": {"listChanged": True},
             },
-            id=req.id,
-        )
+            "serverInfo": {
+                "name": self.SERVER_NAME,
+                "version": self.SERVER_VERSION,
+                "title": self._title,
+            },
+        }
+        if self._instructions:
+            result["instructions"] = self._instructions
+        return MCPResponse(result=result, id=req.id)
 
     def _handle_tools_list(self, req: MCPRequest) -> MCPResponse:
         """Handle tools/list — return specs for all registered tools."""
@@ -271,7 +286,7 @@ class MCPServer:
                 "inputSchema": s.parameters,
             }
             # Add annotations if available (MCP spec 2025-11-25)
-            annotations = _TOOL_ANNOTATIONS.get(s.name)
+            annotations = s.metadata.get("annotations") or _TOOL_ANNOTATIONS.get(s.name)
             if annotations:
                 entry["annotations"] = annotations
             tool_list.append(entry)
@@ -305,11 +320,11 @@ class MCPServer:
                 arguments=json.dumps(arguments),
             )
             result = self._executor.execute(tool_call)
+            # Tools may return richer MCP content (e.g. images) in metadata.
+            content = result.metadata.get("mcp_content") if result.success else None
             return MCPResponse(
                 result={
-                    "content": [
-                        {"type": "text", "text": result.content},
-                    ],
+                    "content": content or [{"type": "text", "text": result.content}],
                     "isError": not result.success,
                 },
                 id=req.id,
