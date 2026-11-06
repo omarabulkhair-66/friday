@@ -1170,6 +1170,9 @@ class ServerConfig:
     agent: str = "orchestrator"
     model: str = ""
     workers: int = 1
+    # Let non-loopback clients use the /mcp agents endpoint (API key still
+    # required when one is set).
+    mcp_allow_remote: bool = False
     cors_origins: list = field(
         default_factory=lambda: [
             "http://localhost:3000",

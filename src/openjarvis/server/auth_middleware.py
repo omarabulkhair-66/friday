@@ -85,6 +85,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         endpoints. This only applies when an API key is configured at all, so
         keyless local use is unchanged.
 
+        ``/mcp`` (the agents MCP endpoint) needs the key like the REST API.
+
         The MCP OAuth callback is exempt: the browser arrives there from the
         authorization server without the API key, and the single-use
         ``state`` it must carry is what authorizes it.
@@ -94,6 +96,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return (
             path.startswith("/v1/")
             or path.startswith("/api/")
+            or path == "/mcp"
+            or path.startswith("/mcp/")
             or path == "/metrics"
             or path.startswith("/metrics/")
             or path in ("/openapi.json", "/docs", "/redoc")

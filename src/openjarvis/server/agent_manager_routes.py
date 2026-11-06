@@ -79,6 +79,63 @@ def _start_managed_worker(app_state: Any, target: Any, *, name: str) -> Any:
     return thread
 
 
+def start_immediate_tick(manager: Any, app_state: Any, agent_id: str) -> Any:
+    """Run one tick for *agent_id* in a tracked background worker.
+
+    Re-uses the server's engine, model and config so the agent answers with
+    the same system as the UI. Raises ``RuntimeError`` while shutting down.
+    """
+    import time as _time
+
+    from openjarvis.agents.executor import AgentExecutor
+
+    srv_engine = getattr(app_state, "engine", None)
+    srv_model = getattr(app_state, "model", "")
+    srv_config = getattr(app_state, "config", None)
+    srv_bus = _get_runtime_event_bus(app_state)
+
+    def _immediate_tick():
+        start = _time.time()
+        logger.info(
+            "Immediate tick starting for agent %s (model=%s)", agent_id, srv_model
+        )
+        try:
+            executor = AgentExecutor(
+                manager=manager,
+                event_bus=srv_bus,
+                trace_store=getattr(app_state, "trace_store", None),
+            )
+            system = _make_lightweight_system(
+                srv_engine, srv_model, srv_config, app_state
+            )
+            executor.set_system(system)
+            logger.info(
+                "Immediate tick: system ready in %.1fs, executing tick for agent %s",
+                _time.time() - start,
+                agent_id,
+            )
+            executor.execute_tick(agent_id)
+            logger.info(
+                "Immediate tick completed for agent %s in %.1fs",
+                agent_id,
+                _time.time() - start,
+            )
+        except Exception as exc:
+            logger.error(
+                "Immediate tick failed for agent %s: %s", agent_id, exc, exc_info=True
+            )
+            try:
+                manager.end_tick(agent_id)
+            except Exception:
+                pass
+            manager.update_agent(agent_id, status="error")
+            manager.update_summary_memory(agent_id, f"ERROR: {exc}")
+
+    return _start_managed_worker(
+        app_state, _immediate_tick, name=f"managed-agent-immediate-{agent_id}"
+    )
+
+
 class CreateAgentRequest(BaseModel):
     name: str
     agent_type: str = "monitor_operative"
@@ -2310,73 +2367,8 @@ def create_agent_manager_router(
         if not req.stream and req.mode == "immediate":
             # Non-streaming immediate: trigger a background tick so the
             # agent processes the message, then return the stored msg.
-            # Re-use the server's existing system (correct model/engine).
-            import time as _time
-
-            from openjarvis.agents.executor import AgentExecutor
-
-            _app_state = request.app.state
-            _srv_engine = getattr(_app_state, "engine", None)
-            _srv_model = getattr(_app_state, "model", "")
-            _srv_config = getattr(_app_state, "config", None)
-            _srv_bus = _get_runtime_event_bus(_app_state)
-
-            def _immediate_tick():
-                _start = _time.time()
-                logger.info(
-                    "Immediate tick starting for agent %s (model=%s)",
-                    agent_id,
-                    _srv_model,
-                )
-                try:
-                    _ts2 = getattr(_app_state, "trace_store", None)
-                    executor = AgentExecutor(
-                        manager=manager,
-                        event_bus=_srv_bus,
-                        trace_store=_ts2,
-                    )
-                    system = _make_lightweight_system(
-                        _srv_engine,
-                        _srv_model,
-                        _srv_config,
-                        _app_state,
-                    )
-                    executor.set_system(system)
-                    logger.info(
-                        "Immediate tick: system ready in %.1fs, "
-                        "executing tick for agent %s",
-                        _time.time() - _start,
-                        agent_id,
-                    )
-                    executor.execute_tick(agent_id)
-                    logger.info(
-                        "Immediate tick completed for agent %s in %.1fs",
-                        agent_id,
-                        _time.time() - _start,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Immediate tick failed for agent %s: %s",
-                        agent_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    try:
-                        manager.end_tick(agent_id)
-                    except Exception:
-                        pass
-                    manager.update_agent(agent_id, status="error")
-                    manager.update_summary_memory(
-                        agent_id,
-                        f"ERROR: {exc}",
-                    )
-
             try:
-                _start_managed_worker(
-                    _app_state,
-                    _immediate_tick,
-                    name=f"managed-agent-immediate-{agent_id}",
-                )
+                start_immediate_tick(manager, request.app.state, agent_id)
             except RuntimeError as exc:
                 raise HTTPException(status_code=503, detail=str(exc))
             return msg

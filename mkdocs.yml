@@ -192,6 +192,7 @@ nav:
       - Tools: user-guide/tools.md
       - Memory: user-guide/memory.md
       - External MCP Servers: user-guide/mcp-external-servers.md
+      - Agents over MCP: user-guide/mcp-agents-endpoint.md
       - Scheduler: user-guide/scheduler.md
       - Telemetry: user-guide/telemetry.md
       - Evaluations: user-guide/evaluations.md

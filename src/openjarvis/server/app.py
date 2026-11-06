@@ -489,6 +489,11 @@ def create_app(
     app.include_router(research_router)
     app.include_router(analytics_router)
     include_all_routes(app)
+    if agent_manager is not None:
+        # Before the SPA catch-all so GET /mcp is not served index.html.
+        from openjarvis.server.mcp_endpoint import create_mcp_endpoint_router
+
+        app.include_router(create_mcp_endpoint_router())
 
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
