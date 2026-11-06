@@ -26,7 +26,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode, urlparse
 
 _HTTP_TIMEOUT = 15.0
@@ -223,6 +223,9 @@ class PendingSignIn:
     client_id: str
     client_secret: Optional[str]
     created: float = field(default_factory=time.time)
+    # Stores the tokens somewhere other than the global store (for example
+    # a team's own connection). Returns an error message, or ``None``.
+    save: Optional[Callable[[dict[str, Any]], Optional[str]]] = None
 
 
 class PendingSignIns:
@@ -250,6 +253,18 @@ class PendingSignIns:
             k for k, v in self._items.items() if now - v.created > _STATE_TTL_SECONDS
         ]:
             del self._items[key]
+
+
+_shared_pending = PendingSignIns()
+
+
+def shared_pending() -> PendingSignIns:
+    """The sign-ins in progress for this process.
+
+    Shared by every sign-in that completes at ``/v1/mcp/oauth/callback``,
+    so one redirect URI serves global servers and team connections.
+    """
+    return _shared_pending
 
 
 def authorization_url(
@@ -421,5 +436,6 @@ __all__ = [
     "is_expired",
     "refresh",
     "register_client",
+    "shared_pending",
     "start_sign_in",
 ]

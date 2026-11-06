@@ -6,6 +6,7 @@ import { DashboardPage } from './pages/DashboardPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { GetStartedPage } from './pages/GetStartedPage';
 import { AgentsPage } from './pages/AgentsPage';
+import { NewTeamRequestPage, TeamPage, TeamRequestPage, TeamSettingsPage } from './pages/TeamPages';
 import { DataSourcesPage } from './pages/DataSourcesPage';
 import { LogsPage } from './pages/LogsPage';
 import { McpPage } from './pages/McpPage';
@@ -192,6 +193,10 @@ export default function App() {
           <Route path="data-sources" element={<DataSourcesPage />} />
           <Route path="agents" element={<AgentsPage />} />
           <Route path="mcp" element={<McpPage />} />
+          <Route path="agents/teams/:teamId" element={<TeamPage />} />
+          <Route path="agents/teams/:teamId/settings" element={<TeamSettingsPage />} />
+          <Route path="agents/teams/:teamId/requests/new" element={<NewTeamRequestPage />} />
+          <Route path="agents/teams/:teamId/requests/:requestId" element={<TeamRequestPage />} />
           <Route path="logs" element={<LogsPage />} />
         </Route>
       </Routes>
