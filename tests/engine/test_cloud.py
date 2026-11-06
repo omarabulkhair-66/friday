@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from openjarvis.core.registry import EngineRegistry
-from openjarvis.core.types import Message, Role
+from openjarvis.core.types import Message, Role, ToolCall
 from openjarvis.engine._base import EngineConnectionError
 from openjarvis.engine.cloud import (
     CloudEngine,
@@ -551,6 +552,37 @@ class TestCodexClientInit:
         assert "codex/gpt-4o" not in engine.list_models()
 
 
+def _sse_lines(*events: dict) -> list:
+    """Encode Responses API events as SSE ``data:`` lines."""
+    lines = ["event: ping", ""]
+    for event in events:
+        lines.append("data: " + json.dumps(event))
+        lines.append("")
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _fake_codex_stream(*events: dict) -> mock.MagicMock:
+    """Patchable stand-in for ``httpx.stream`` yielding the given events."""
+    resp = mock.MagicMock()
+    resp.is_error = False
+    resp.raise_for_status = mock.MagicMock()
+    resp.iter_lines.return_value = iter(_sse_lines(*events))
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    ctx.__exit__.return_value = False
+    return mock.MagicMock(return_value=ctx)
+
+
+def _codex_engine() -> CloudEngine:
+    engine = CloudEngine()
+    engine._codex_client = {
+        "token": "test-token",
+        "url": "https://api.openai.com/v1/responses",
+    }
+    return engine
+
+
 class TestCodexGenerate:
     def test_generate_codex_uses_responses_api(
         self, monkeypatch: pytest.MonkeyPatch
@@ -558,24 +590,18 @@ class TestCodexGenerate:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-        fake_response = mock.MagicMock()
-        fake_response.status_code = 200
-        fake_response.json.return_value = {
-            "output_text": "Codex response!",
-            "usage": {"input_tokens": 10, "output_tokens": 5},
-        }
-        fake_response.raise_for_status = mock.MagicMock()
+        fake_stream = _fake_codex_stream(
+            {
+                "type": "response.completed",
+                "response": {
+                    "output_text": "Codex response!",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            }
+        )
+        engine = _codex_engine()
 
-        engine = CloudEngine()
-        engine._codex_client = {
-            "token": "test-token",
-            "url": "https://api.openai.com/v1/responses",
-        }
-
-        with mock.patch(
-            "openjarvis.engine.cloud.httpx.post",
-            return_value=fake_response,
-        ) as mock_post:
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
             result = engine.generate(
                 [Message(role=Role.USER, content="Hi")],
                 model="codex/gpt-5-mini-2025-08-07",
@@ -585,19 +611,24 @@ class TestCodexGenerate:
         assert result["model"] == "gpt-5-mini-2025-08-07"
         assert result["usage"]["prompt_tokens"] == 10
         assert result["usage"]["completion_tokens"] == 5
+        assert result["finish_reason"] == "stop"
+        assert "tool_calls" not in result
 
         # Verify correct Responses API request format
-        call_kwargs = mock_post.call_args
-        sent_body = call_kwargs.kwargs["json"]
+        call = fake_stream.call_args
+        assert call.args == ("POST", "https://api.openai.com/v1/responses")
+        sent_body = call.kwargs["json"]
         assert sent_body["model"] == "gpt-5-mini-2025-08-07"
-        assert sent_body["stream"] is False
+        assert sent_body["stream"] is True
         assert "input" in sent_body  # Responses API format
         assert "messages" not in sent_body  # NOT chat completions
+        assert "tools" not in sent_body
 
         # Verify correct headers
-        sent_headers = call_kwargs.kwargs["headers"]
+        sent_headers = call.kwargs["headers"]
         assert sent_headers["Authorization"] == "Bearer test-token"
         assert sent_headers["OpenAI-Beta"] == "responses=experimental"
+        assert sent_headers["Accept"] == "text/event-stream"
 
     def test_generate_codex_extracts_from_output_blocks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -606,28 +637,46 @@ class TestCodexGenerate:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-        fake_response = mock.MagicMock()
-        fake_response.json.return_value = {
-            "output": [{"content": [{"type": "output_text", "text": "From blocks!"}]}],
-            "usage": {"input_tokens": 5, "output_tokens": 3},
-        }
-        fake_response.raise_for_status = mock.MagicMock()
+        fake_stream = _fake_codex_stream(
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {"content": [{"type": "output_text", "text": "From blocks!"}]}
+                    ],
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                },
+            }
+        )
+        engine = _codex_engine()
 
-        engine = CloudEngine()
-        engine._codex_client = {
-            "token": "t",
-            "url": "https://api.openai.com/v1/responses",
-        }
-
-        with mock.patch(
-            "openjarvis.engine.cloud.httpx.post",
-            return_value=fake_response,
-        ):
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
             result = engine.generate(
                 [Message(role=Role.USER, content="Hi")],
                 model="codex/gpt-4o",
             )
         assert result["content"] == "From blocks!"
+
+    def test_generate_codex_joins_text_deltas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Text comes from streamed deltas when the final payload has none."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        fake_stream = _fake_codex_stream(
+            {"type": "response.output_text.delta", "delta": "Hel"},
+            {"type": "response.output_text.delta", "delta": "lo"},
+            {"type": "response.completed", "response": {"usage": {}}},
+        )
+        engine = _codex_engine()
+
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
+            result = engine.generate(
+                [Message(role=Role.USER, content="Hi")],
+                model="codex/gpt-4o",
+            )
+        assert result["content"] == "Hello"
 
     def test_generate_codex_passes_system_as_instructions(
         self, monkeypatch: pytest.MonkeyPatch
@@ -635,23 +684,12 @@ class TestCodexGenerate:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-        fake_response = mock.MagicMock()
-        fake_response.json.return_value = {
-            "output_text": "ok",
-            "usage": {},
-        }
-        fake_response.raise_for_status = mock.MagicMock()
+        fake_stream = _fake_codex_stream(
+            {"type": "response.completed", "response": {"output_text": "ok"}}
+        )
+        engine = _codex_engine()
 
-        engine = CloudEngine()
-        engine._codex_client = {
-            "token": "t",
-            "url": "https://api.openai.com/v1/responses",
-        }
-
-        with mock.patch(
-            "openjarvis.engine.cloud.httpx.post",
-            return_value=fake_response,
-        ) as mock_post:
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
             engine.generate(
                 [
                     Message(role=Role.SYSTEM, content="Be helpful"),
@@ -660,11 +698,225 @@ class TestCodexGenerate:
                 model="codex/gpt-4o",
             )
 
-        sent_body = mock_post.call_args.kwargs["json"]
+        sent_body = fake_stream.call_args.kwargs["json"]
         assert sent_body["instructions"] == "Be helpful"
         # System message should NOT appear in input messages
         roles = [m["role"] for m in sent_body["input"]]
         assert "system" not in roles
+
+    def test_generate_codex_sends_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        fake_stream = _fake_codex_stream(
+            {"type": "response.completed", "response": {"output_text": "ok"}}
+        )
+        engine = _codex_engine()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
+            engine.generate(
+                [Message(role=Role.USER, content="Weather?")],
+                model="codex/gpt-4o",
+                tools=tools,
+            )
+
+        sent_body = fake_stream.call_args.kwargs["json"]
+        assert sent_body["tool_choice"] == "auto"
+        assert sent_body["tools"] == [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Look up weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            }
+        ]
+
+    def test_generate_codex_parses_tool_calls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tool calls come from streamed items and the final output, deduped."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        weather_call = {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city": "Cairo"}',
+        }
+        time_call = {
+            "type": "function_call",
+            "id": "fc_2",
+            "call_id": "call_2",
+            "name": "get_time",
+            "arguments": "",
+        }
+        fake_stream = _fake_codex_stream(
+            {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+            {"type": "response.output_item.done", "item": weather_call},
+            {"type": "response.output_item.done", "item": time_call},
+            {
+                "type": "response.completed",
+                # The final payload repeats only the first call.
+                "response": {"output": [weather_call], "usage": {}},
+            },
+        )
+        engine = _codex_engine()
+
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
+            result = engine.generate(
+                [Message(role=Role.USER, content="Weather and time?")],
+                model="codex/gpt-4o",
+            )
+
+        assert result["finish_reason"] == "tool_calls"
+        assert result["tool_calls"] == [
+            {"id": "call_1", "name": "get_weather", "arguments": '{"city": "Cairo"}'},
+            {"id": "call_2", "name": "get_time", "arguments": "{}"},
+        ]
+
+    def test_generate_codex_raises_on_http_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        fake_stream = _fake_codex_stream()
+        resp = fake_stream.return_value.__enter__.return_value
+        resp.is_error = True
+        resp.raise_for_status.side_effect = RuntimeError("400 Bad Request")
+        engine = _codex_engine()
+
+        with mock.patch("openjarvis.engine.cloud.httpx.stream", fake_stream):
+            with pytest.raises(RuntimeError, match="400"):
+                engine.generate(
+                    [Message(role=Role.USER, content="Hi")],
+                    model="codex/gpt-4o",
+                )
+        # The error body is read so raise_for_status can include it.
+        resp.read.assert_called_once()
+
+    def test_codex_tools_conversion(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search docs",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                        "required": ["q"],
+                    },
+                },
+            },
+            # No parameters / description -> defaults filled in.
+            {"type": "function", "function": {"name": "ping"}},
+            # Malformed specs are skipped.
+            {"type": "function", "function": {"description": "no name"}},
+            {"type": "function"},
+            "not-a-dict",
+        ]
+        assert CloudEngine._codex_tools(tools) == [
+            {
+                "type": "function",
+                "name": "search",
+                "description": "Search docs",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "ping",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        assert CloudEngine._codex_tools(None) == []
+
+    def test_codex_build_input_tool_round_trip(self) -> None:
+        messages = [
+            Message(role=Role.SYSTEM, content="Be helpful"),
+            Message(role=Role.USER, content="Weather in Cairo?"),
+            Message(
+                role=Role.ASSISTANT,
+                content="Let me check.",
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="get_weather",
+                        arguments='{"city": "Cairo"}',
+                    )
+                ],
+            ),
+            Message(role=Role.TOOL, content="31C, sunny", tool_call_id="call_1"),
+        ]
+        instructions, input_msgs = CloudEngine._codex_build_input(messages)
+
+        assert instructions == "Be helpful"
+        assert input_msgs == [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Weather in Cairo?"}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Let me check."}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city": "Cairo"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "31C, sunny",
+            },
+        ]
+
+    def test_codex_build_input_tool_call_without_text(self) -> None:
+        """Assistant turns with only tool calls emit no empty message item,
+        and non-string arguments are JSON-encoded."""
+        messages = [
+            Message(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(id="call_9", name="ping", arguments={"x": 1})  # type: ignore[arg-type]
+                ],
+            ),
+        ]
+        _, input_msgs = CloudEngine._codex_build_input(messages)
+        assert input_msgs == [
+            {
+                "type": "function_call",
+                "call_id": "call_9",
+                "name": "ping",
+                "arguments": '{"x": 1}',
+            }
+        ]
 
     def test_codex_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
