@@ -152,6 +152,15 @@ _ATLASCLOUD_POPULAR = [
 # Codex models — prefixed with "codex/" for ChatGPT Plus/Pro subscribers.
 # Uses the Responses API at chatgpt.com, not the standard OpenAI API.
 _CODEX_MODELS = [
+    # Models the ChatGPT-subscription Codex backend currently accepts.
+    "codex/gpt-6.1-sol",
+    "codex/gpt-6.1-terra",
+    "codex/gpt-6-sol",
+    "codex/gpt-6-astra",
+    "codex/gpt-6-luna",
+    "codex/gpt-5.6-sol",
+    "codex/gpt-5.6-terra",
+    "codex/gpt-5.6-luna",
     "codex/gpt-4o",
     "codex/gpt-4o-mini",
     "codex/o3-mini",
@@ -582,14 +591,62 @@ class CloudEngine(InferenceEngine):
         for m in messages:
             if m.role.value == "system":
                 instructions = m.content
-            elif m.role.value in ("user", "assistant"):
+            elif m.role.value == "tool":
+                # Result of a tool the model asked for, linked by call id.
                 input_msgs.append(
                     {
-                        "role": m.role.value,
+                        "type": "function_call_output",
+                        "call_id": m.tool_call_id or "",
+                        "output": m.content or "",
+                    }
+                )
+            elif m.role.value == "assistant":
+                if m.content:
+                    input_msgs.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": m.content}],
+                        }
+                    )
+                for tc in m.tool_calls or []:
+                    args = tc.arguments
+                    if not isinstance(args, str):
+                        args = json.dumps(args or {})
+                    input_msgs.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "arguments": args,
+                        }
+                    )
+            elif m.role.value == "user":
+                input_msgs.append(
+                    {
+                        "role": "user",
                         "content": [{"type": "input_text", "text": m.content}],
                     }
                 )
         return instructions, input_msgs
+
+    @staticmethod
+    def _codex_tools(tools: Any) -> List[Dict[str, Any]]:
+        """Convert OpenAI chat-completions tool specs to Responses API format."""
+        converted: List[Dict[str, Any]] = []
+        for tool in tools or []:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            if not fn or not fn.get("name"):
+                continue
+            converted.append(
+                {
+                    "type": "function",
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters")
+                    or {"type": "object", "properties": {}},
+                }
+            )
+        return converted
 
     def _generate_codex(
         self,
@@ -612,27 +669,55 @@ class CloudEngine(InferenceEngine):
             "model": actual_model,
             "input": input_msgs,
             "store": False,
-            "stream": False,
+            # The ChatGPT-subscription Codex backend rejects stream=False,
+            # so stream and keep the final response.completed payload.
+            "stream": True,
         }
         if instructions:
             body["instructions"] = instructions
+        codex_tools = self._codex_tools(kwargs.get("tools"))
+        if codex_tools:
+            body["tools"] = codex_tools
+            body["tool_choice"] = "auto"
 
         headers = {
             "Authorization": f"Bearer {self._codex_client['token']}",
             "Content-Type": "application/json",
+            "Accept": "text/event-stream",
             "OpenAI-Beta": "responses=experimental",
         }
 
         t0 = time.monotonic()
-        resp = httpx.post(
+        data: Dict[str, Any] = {}
+        deltas: List[str] = []
+        streamed_items: List[Dict[str, Any]] = []
+        with httpx.stream(
+            "POST",
             self._codex_client["url"],
             json=body,
             headers=headers,
             timeout=120.0,
-        )
+        ) as resp:
+            if resp.is_error:
+                resp.read()
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                etype = event.get("type", "")
+                if etype == "response.output_text.delta":
+                    deltas.append(event.get("delta", ""))
+                elif etype == "response.output_item.done":
+                    streamed_items.append(event.get("item") or {})
+                elif etype == "response.completed":
+                    data = event.get("response", {}) or {}
         elapsed = time.monotonic() - t0
-        resp.raise_for_status()
-        data = resp.json()
+        if not data.get("output_text") and deltas:
+            data["output_text"] = "".join(deltas)
 
         # Extract text from Responses API output.
         # The output array contains items of type "reasoning" and "message";
@@ -649,11 +734,30 @@ class CloudEngine(InferenceEngine):
                 if content:
                     break
 
+        # Tool calls arrive as "function_call" output items. The final
+        # response may omit them, so fall back to the streamed items.
+        tool_calls: List[Dict[str, Any]] = []
+        seen_calls: set = set()
+        for item in list(data.get("output") or []) + streamed_items:
+            if item.get("type") != "function_call":
+                continue
+            call_id = item.get("call_id") or item.get("id") or ""
+            if call_id in seen_calls:
+                continue
+            seen_calls.add(call_id)
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments") or "{}",
+                }
+            )
+
         usage_data = data.get("usage", {})
         prompt_tokens = usage_data.get("input_tokens", 0)
         completion_tokens = usage_data.get("output_tokens", 0)
 
-        return {
+        result: Dict[str, Any] = {
             "content": content,
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -661,10 +765,13 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": actual_model,
-            "finish_reason": "stop",
+            "finish_reason": "tool_calls" if tool_calls else "stop",
             "cost_usd": 0.0,
             "ttft": elapsed,
         }
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
 
     def _generate_openai(
         self,
